@@ -40,8 +40,16 @@ vi.mock("../thread-queries", () => ({
 vi.mock("../chunk-queries", () => ({ deleteChunks: dependencyMocks.deleteChunks }));
 vi.mock("../../utils/event-bus", () => ({ eventBus: eventBusMocks }));
 
-const { getBooks, getBook, getDeletedBookByFileHash, insertBook, updateBook, deleteBook } =
-  await import("../book-queries");
+const {
+  getBooks,
+  getBook,
+  getBookProgressState,
+  getDeletedBookByFileHash,
+  insertBook,
+  saveBookProgress,
+  updateBook,
+  deleteBook,
+} = await import("../book-queries");
 
 const sampleBook: Book = {
   id: "book-1",
@@ -263,6 +271,96 @@ describe("book-queries", () => {
       await updateBook("book-1", {});
       expect(mockExecute).not.toHaveBeenCalled();
       expect(eventBusMocks.emit).not.toHaveBeenCalled();
+    });
+
+    it("does not bump updated_at when only local-only fields change", async () => {
+      mockExecute.mockResolvedValue(undefined);
+
+      await updateBook("book-1", { lastOpenedAt: 5000, vectorizeProgress: 40 });
+
+      const [sql] = mockExecute.mock.calls[0];
+      expect(sql).toContain("last_opened_at = ?");
+      expect(sql).not.toContain("updated_at");
+      expect(sql).not.toContain("last_modified_by");
+      expect(coreMocks.nextUpdatedAt).not.toHaveBeenCalled();
+    });
+
+    it("bumps updated_at when a synced field changes alongside a local-only one", async () => {
+      mockExecute.mockResolvedValue(undefined);
+
+      await updateBook("book-1", { lastOpenedAt: 5000, tags: ["a"] });
+
+      const [sql] = mockExecute.mock.calls[0];
+      expect(sql).toContain("updated_at = ?");
+    });
+  });
+
+  describe("saveBookProgress", () => {
+    const row = (overrides: Record<string, unknown> = {}) => ({
+      progress: 0.25,
+      current_cfi: "cfi-phone",
+      updated_at: 2000,
+      last_modified_by: "phone",
+      ...overrides,
+    });
+    const position = { progress: 0.24, currentCfi: "cfi-desktop" };
+
+    it("saves when the row has not changed since the baseline", async () => {
+      mockExecute.mockResolvedValue(undefined);
+      mockSelect.mockResolvedValue([row()]);
+
+      const result = await saveBookProgress("book-1", position, 2000);
+
+      expect(result).toEqual({ saved: true, updatedAt: 3000 });
+      const [sql, params] = mockExecute.mock.calls[0];
+      expect(sql).toContain("progress = ?");
+      expect(params).toContain("cfi-desktop");
+    });
+
+    it("refuses to overwrite a position another device wrote after the baseline", async () => {
+      mockSelect.mockResolvedValue([row()]);
+
+      const result = await saveBookProgress("book-1", position, 1500);
+
+      expect(result).toEqual({
+        saved: false,
+        remote: {
+          progress: 0.25,
+          currentCfi: "cfi-phone",
+          updatedAt: 2000,
+          fromOtherDevice: true,
+        },
+      });
+      expect(mockExecute).not.toHaveBeenCalled();
+    });
+
+    it("saves when the newer row was written by this device", async () => {
+      mockExecute.mockResolvedValue(undefined);
+      mockSelect.mockResolvedValue([row({ last_modified_by: "device-1" })]);
+
+      const result = await saveBookProgress("book-1", position, 1500);
+
+      expect(result.saved).toBe(true);
+      expect(mockExecute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("getBookProgressState", () => {
+    it("returns null for a missing book", async () => {
+      mockSelect.mockResolvedValue([]);
+      expect(await getBookProgressState("nope")).toBeNull();
+    });
+
+    it("flags rows written by another device", async () => {
+      mockSelect.mockResolvedValue([
+        { progress: 0.5, current_cfi: null, updated_at: 10, last_modified_by: "phone" },
+      ]);
+      expect(await getBookProgressState("book-1")).toEqual({
+        progress: 0.5,
+        currentCfi: null,
+        updatedAt: 10,
+        fromOtherDevice: true,
+      });
     });
   });
 

@@ -26,6 +26,8 @@ export {
   getDeletedBookByFileHash,
   insertBook,
   updateBook,
+  getBookProgressState,
+  saveBookProgress,
   setBookSyncStatus,
   deleteBook,
   // Group queries

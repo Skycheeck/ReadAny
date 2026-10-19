@@ -40,9 +40,12 @@ export {
   getDeletedBookByTitle,
   insertBook,
   updateBook,
+  getBookProgressState,
+  saveBookProgress,
   setBookSyncStatus,
   deleteBook,
 } from "./book-queries";
+export type { BookProgressState, SaveBookProgressResult } from "./book-queries";
 
 export {
   getGroups,

@@ -354,6 +354,11 @@ export interface LibraryState {
   addBook: (book: Book) => void;
   removeBook: (bookId: string, options?: RemoveBookOptions) => Promise<void>;
   updateBook: (bookId: string, updates: Partial<Book>) => Promise<void>;
+  /** Mirrors a reading position already written to the database into the in-memory library. */
+  patchBookPosition: (
+    bookId: string,
+    position: { progress: number; currentCfi: string; updatedAt: number },
+  ) => void;
   setFilter: (filter: Partial<LibraryFilter>) => void;
   setViewMode: (mode: LibraryViewMode) => void;
   setSortField: (field: SortField) => void;
@@ -852,6 +857,23 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     await db
       .updateBook(bookId, updates)
       .catch((err) => console.error("Failed to update book in database:", err));
+  },
+
+  patchBookPosition: (bookId, position) => {
+    set((state) => ({
+      books: state.books.map((b) =>
+        b.id === bookId
+          ? {
+              ...b,
+              progress: position.progress,
+              currentCfi: position.currentCfi,
+              updatedAt: position.updatedAt,
+              lastOpenedAt: Date.now(),
+            }
+          : b,
+      ),
+    }));
+    debouncedSave("library-books", get().books);
   },
 
   setFilter: (filter) => set((state) => ({ filter: { ...state.filter, ...filter } })),

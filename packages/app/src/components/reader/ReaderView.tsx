@@ -31,6 +31,10 @@ import { useReaderStore } from "@/stores/reader-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useTTSStore } from "@/stores/tts-store";
 import { useChapterTranslation } from "@readany/core/hooks";
+import { getBookProgressState, saveBookProgress } from "@readany/core/db/database";
+import type { BookProgressState } from "@readany/core/db/database";
+import { ReaderPositionSync } from "@readany/core/reader/position-sync";
+import type { PositionSyncOutcome } from "@readany/core/reader/position-sync";
 import { getPlatformService } from "@readany/core/services";
 import { getCSSFontFace, useFontStore, useReadingSessionStore } from "@readany/core/stores";
 import { useRubyStore } from "@readany/core/stores/ruby-store";
@@ -534,7 +538,6 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   ]);
 
   const books = useLibraryStore((s) => s.books);
-  const updateBook = useLibraryStore((s) => s.updateBook);
   const book = books.find((b) => b.id === bookId);
 
   const highlights = useAnnotationStore((s) => s.highlights);
@@ -979,11 +982,10 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   } | null>(null);
   const totalBookCharactersRef = useRef<number | null>(null);
   const progressTrackingGuardUntilRef = useRef(0);
-  const latestProgressRef = useRef<{
-    bookId: string;
-    progress: number;
-    cfi: string;
-  } | null>(null);
+  // Relocations before this time come from restoring the saved position (or from
+  // jumping to a position adopted from another device), not from the user.
+  const restorePositionGuardUntilRef = useRef(0);
+  const positionSyncRef = useRef<{ bookId: string; tracker: ReaderPositionSync } | null>(null);
 
   const suppressProgressTracking = useCallback((duration = PROGRAMMATIC_NAV_GUARD_MS) => {
     progressTrackingGuardUntilRef.current = Math.max(
@@ -1023,37 +1025,133 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     window.localStorage.setItem(TOOLBAR_PIN_STORAGE_KEY, String(isToolbarPinned));
   }, [isToolbarPinned]);
 
+  // Reading position <-> sync. The tracker decides what may be written to the
+  // database and when a newer position from another device must be adopted.
+  const getPositionSync = useCallback((): ReaderPositionSync => {
+    const existing = positionSyncRef.current;
+    if (existing?.bookId === bookId) return existing.tracker;
+
+    const current = useLibraryStore.getState().books.find((b) => b.id === bookId);
+    const tracker = new ReaderPositionSync(
+      {
+        updatedAt: current?.updatedAt ?? 0,
+        cfi: current?.currentCfi ?? null,
+        progress: current?.progress ?? 0,
+      },
+      {
+        save: async (position, baselineUpdatedAt) => {
+          const result = await saveBookProgress(bookId, position, baselineUpdatedAt);
+          if (result.saved) {
+            useLibraryStore.getState().patchBookPosition(bookId, {
+              progress: position.progress,
+              currentCfi: position.currentCfi,
+              updatedAt: result.updatedAt,
+            });
+          }
+          return result;
+        },
+        load: () => getBookProgressState(bookId),
+      },
+    );
+    positionSyncRef.current = { bookId, tracker };
+    return tracker;
+  }, [bookId]);
+
+  const adoptRemotePosition = useCallback(
+    (remote: BookProgressState, announce: boolean) => {
+      if (!remote.currentCfi) return;
+      getPositionSync().adopt(remote);
+      restorePositionGuardUntilRef.current = Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS;
+      useLibraryStore.getState().patchBookPosition(bookId, {
+        progress: remote.progress,
+        currentCfi: remote.currentCfi,
+        updatedAt: remote.updatedAt,
+      });
+      goToCFISafely(remote.currentCfi);
+      if (announce) {
+        toast.info(t("reader.positionAdopted", "已跳转到其他设备的阅读位置"));
+      }
+    },
+    [bookId, getPositionSync, goToCFISafely, t],
+  );
+
+  const handlePositionOutcome = useCallback(
+    (outcome: PositionSyncOutcome) => {
+      if (outcome.type === "adopt") {
+        adoptRemotePosition(outcome.remote, true);
+      } else if (outcome.type === "conflict") {
+        const { remote } = outcome;
+        toast(t("reader.positionConflictTitle", "其他设备的阅读进度不同"), {
+          id: `reader-position-conflict-${bookId}`,
+          description: t("reader.positionConflictDescription", {
+            percent: Math.round(remote.progress * 100),
+            defaultValue: "另一台设备停在 {{percent}}%，要跳转过去吗？",
+          }),
+          duration: Number.POSITIVE_INFINITY,
+          action: {
+            label: t("reader.positionConflictJump", "跳转"),
+            onClick: () => adoptRemotePosition(remote, false),
+          },
+          cancel: {
+            label: t("reader.positionConflictKeep", "保留当前"),
+            onClick: () => getPositionSync().keepLocal(remote),
+          },
+          onDismiss: () => getPositionSync().keepLocal(remote),
+        });
+      }
+    },
+    [adoptRemotePosition, bookId, getPositionSync, t],
+  );
+
+  const flushPosition = useCallback(async () => {
+    const current = positionSyncRef.current;
+    if (!current || current.bookId !== bookId) return;
+    try {
+      handlePositionOutcome(await current.tracker.flush());
+    } catch (err) {
+      console.error("[ReaderView] Failed to save reading position:", err);
+    }
+  }, [bookId, handlePositionOutcome]);
+
+  const flushPositionRef = useRef(flushPosition);
+  flushPositionRef.current = flushPosition;
+
   // Throttled progress save
   const throttledSaveProgress = useRef(
-    throttle((bId: string, prog: number, cfi: string) => {
-      updateBook(bId, {
-        progress: prog,
-        currentCfi: cfi,
-        lastOpenedAt: Date.now(),
-      });
+    throttle(() => {
+      void flushPositionRef.current();
     }, 5000),
   ).current;
 
-  const flushLatestProgress = useCallback(() => {
-    const latest = latestProgressRef.current;
-    if (!latest || latest.bookId !== bookId) return;
-    updateBook(latest.bookId, {
-      progress: latest.progress,
-      currentCfi: latest.cfi,
-      lastOpenedAt: Date.now(),
-    });
-  }, [bookId, updateBook]);
-
   useEffect(() => {
-    window.addEventListener("pagehide", flushLatestProgress);
-    window.addEventListener("beforeunload", flushLatestProgress);
+    // Closing the reader must not raise a conflict prompt, so the outcome is ignored.
+    const flush = () => {
+      const current = positionSyncRef.current;
+      if (current?.bookId !== bookId) return;
+      current.tracker.flush().catch((err) => {
+        console.error("[ReaderView] Failed to save reading position:", err);
+      });
+    };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
 
     return () => {
-      window.removeEventListener("pagehide", flushLatestProgress);
-      window.removeEventListener("beforeunload", flushLatestProgress);
-      flushLatestProgress();
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      flush();
     };
-  }, [flushLatestProgress]);
+  }, [bookId]);
+
+  // After sync: adopt a newer position written by another device, or ask.
+  useEffect(() => {
+    return eventBus.on("sync:completed", () => {
+      const tracker = getPositionSync();
+      void tracker
+        .checkRemote()
+        .then(handlePositionOutcome)
+        .catch((err) => console.error("[ReaderView] Failed to check synced position:", err));
+    });
+  }, [getPositionSync, handlePositionOutcome]);
 
   // --- Load book on mount ---
   useEffect(() => {
@@ -1089,7 +1187,8 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   useEffect(() => {
     sessionProgressRef.current = null;
-    latestProgressRef.current = null;
+    positionSyncRef.current = null;
+    restorePositionGuardUntilRef.current = Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS;
     suppressProgressTracking(INITIAL_PROGRESS_RESTORE_GUARD_MS);
   }, [bookId, tabId, bookFormat, suppressProgressTracking]);
 
@@ -1245,7 +1344,8 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
       // Update reader store (immediate)
       setProgress(tabId, progress, cfi);
-      latestProgressRef.current = { bookId, progress, cfi };
+      const restoringPosition = Date.now() < restorePositionGuardUntilRef.current;
+      getPositionSync().noteRelocate({ progress, cfi }, { restoring: restoringPosition });
 
       // Update chapter info
       if (detail.tocItem?.label) {
@@ -1336,7 +1436,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       }
 
       // Throttled save to DB
-      throttledSaveProgress(bookId, progress, cfi);
+      if (!restoringPosition) throttledSaveProgress();
 
       // Mark translation ready after first successful relocate (CFI navigation done)
       if (!translationReady) setTranslationReady(true);
@@ -1355,10 +1455,10 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     },
     [
       tabId,
-      bookId,
       isFixedLayout,
       setProgress,
       setChapter,
+      getPositionSync,
       throttledSaveProgress,
       translationReady,
     ],
@@ -1369,6 +1469,11 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, []);
 
   const handleLoaded = useCallback(() => {
+    // The first relocate after the view loads restores the saved position.
+    restorePositionGuardUntilRef.current = Math.max(
+      restorePositionGuardUntilRef.current,
+      Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS,
+    );
     setIsLoading(false);
     // Mark foliate as ready to receive annotations
     setFoliateReady(true);

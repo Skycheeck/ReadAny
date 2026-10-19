@@ -207,7 +207,25 @@ export async function insertBook(book: Book): Promise<void> {
   );
 }
 
+/**
+ * Fields that never change what other devices see of a book (or are not synced
+ * at all). Writing only these must not bump `updated_at`: sync resolves a book
+ * row by last-write-wins, so a bump here would let a stale reading position
+ * beat a newer one from another device.
+ */
+const LOCAL_ONLY_BOOK_FIELDS: ReadonlySet<string> = new Set([
+  "lastOpenedAt",
+  "isVectorized",
+  "vectorizeProgress",
+  "syncStatus",
+]);
+
 export async function updateBook(id: string, updates: Partial<Book>): Promise<void> {
+  await applyBookUpdate(id, updates);
+}
+
+/** Applies `updates` and returns the new `updated_at`, or null when it was not bumped. */
+async function applyBookUpdate(id: string, updates: Partial<Book>): Promise<number | null> {
   const database = await getDB();
   const sets: string[] = [];
   const values: unknown[] = [];
@@ -316,18 +334,21 @@ export async function updateBook(id: string, updates: Partial<Book>): Promise<vo
     values.push(updates.syncStatus);
   }
 
-  if (sets.length === 0) return;
+  if (sets.length === 0) return null;
 
-  // Add sync tracking fields
-  const deviceId = await getDeviceId();
-  const syncVersion = await nextSyncVersion(database, "books");
-  const updatedAt = await nextUpdatedAt(database, "books", id);
-  sets.push("updated_at = ?");
-  values.push(updatedAt);
-  sets.push("sync_version = ?");
-  values.push(syncVersion);
-  sets.push("last_modified_by = ?");
-  values.push(deviceId);
+  let updatedAt: number | null = null;
+  if (Object.keys(updates).some((field) => !LOCAL_ONLY_BOOK_FIELDS.has(field))) {
+    // Add sync tracking fields
+    const deviceId = await getDeviceId();
+    const syncVersion = await nextSyncVersion(database, "books");
+    updatedAt = await nextUpdatedAt(database, "books", id);
+    sets.push("updated_at = ?");
+    values.push(updatedAt);
+    sets.push("sync_version = ?");
+    values.push(syncVersion);
+    sets.push("last_modified_by = ?");
+    values.push(deviceId);
+  }
 
   values.push(id);
   await database.execute(`UPDATE books SET ${sets.join(", ")} WHERE id = ?`, values);
@@ -335,6 +356,75 @@ export async function updateBook(id: string, updates: Partial<Book>): Promise<vo
     bookId: id,
     changedFields: Object.keys(updates),
   });
+  return updatedAt;
+}
+
+/** A book's reading position as stored in the local database. */
+export interface BookProgressState {
+  progress: number;
+  currentCfi: string | null;
+  updatedAt: number;
+  /**
+   * True when the row was last written by another device, i.e. it arrived
+   * through sync rather than from this device's own reader or edits.
+   */
+  fromOtherDevice: boolean;
+}
+
+interface BookProgressRow {
+  progress: number | null;
+  current_cfi: string | null;
+  updated_at: number | null;
+  last_modified_by: string | null;
+}
+
+async function readBookProgressState(id: string): Promise<BookProgressState | null> {
+  const database = await getDB();
+  const rows = await database.select<BookProgressRow>(
+    "SELECT progress, current_cfi, updated_at, last_modified_by FROM books WHERE id = ? AND deleted_at IS NULL",
+    [id],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const deviceId = await getDeviceId();
+  return {
+    progress: row.progress ?? 0,
+    currentCfi: row.current_cfi || null,
+    updatedAt: row.updated_at ?? 0,
+    fromOtherDevice: !!row.last_modified_by && row.last_modified_by !== deviceId,
+  };
+}
+
+export async function getBookProgressState(id: string): Promise<BookProgressState | null> {
+  return readBookProgressState(id);
+}
+
+export type SaveBookProgressResult =
+  | { saved: true; updatedAt: number }
+  | { saved: false; remote: BookProgressState };
+
+/**
+ * Saves a reading position unless another device wrote the book after the
+ * caller last looked at it (`baselineUpdatedAt`). A reader that was open while
+ * sync applied a newer position must not write its stale position back with a
+ * fresh timestamp, because last-write-wins would then discard the newer one.
+ */
+export async function saveBookProgress(
+  id: string,
+  position: { progress: number; currentCfi: string },
+  baselineUpdatedAt: number,
+): Promise<SaveBookProgressResult> {
+  const current = await readBookProgressState(id);
+  if (current?.fromOtherDevice && current.updatedAt > baselineUpdatedAt) {
+    return { saved: false, remote: current };
+  }
+
+  const updatedAt = await applyBookUpdate(id, {
+    progress: position.progress,
+    currentCfi: position.currentCfi,
+    lastOpenedAt: Date.now(),
+  });
+  return { saved: true, updatedAt: updatedAt ?? current?.updatedAt ?? 0 };
 }
 
 export async function setBookSyncStatus(id: string, syncStatus: Book["syncStatus"]): Promise<void> {

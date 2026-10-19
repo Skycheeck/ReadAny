@@ -36,10 +36,14 @@ import { useColors, withOpacity } from "@/styles/theme";
 import { useIsFocused } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { readingContextService } from "@readany/core/ai/reading-context-service";
+import { getBookProgressState, saveBookProgress } from "@readany/core/db/database";
+import type { BookProgressState } from "@readany/core/db/database";
 import { runWithDbRetry } from "@readany/core/db/write-retry";
 import { useChapterTranslation } from "@readany/core/hooks";
 import { useReadingSession } from "@readany/core/hooks/use-reading-session";
 import { createSelectionNoteMutation } from "@readany/core/reader";
+import { ReaderPositionSync } from "@readany/core/reader/position-sync";
+import type { PositionSyncOutcome } from "@readany/core/reader/position-sync";
 import { getPlatformService } from "@readany/core/services";
 import { getCSSFontFace, useFontStore } from "@readany/core/stores";
 import type { HighlightColor, ReadSettings, TOCItem } from "@readany/core/types";
@@ -365,15 +369,6 @@ export function ReaderScreen({ route, navigation }: Props) {
   const { books, updateBook } = useLibraryStore();
   const setGoToCfiFn = useReaderStore((s) => s.setGoToCfiFn);
 
-  // Throttled progress save (same as desktop - 5 seconds)
-  const throttledSaveProgress = useRef(
-    throttle((bId: string, prog: number, cfi: string) => {
-      updateBook(bId, {
-        progress: prog,
-        currentCfi: cfi,
-      });
-    }, 5000),
-  ).current;
   const {
     addHighlight,
     updateHighlight,
@@ -422,6 +417,113 @@ export function ReaderScreen({ route, navigation }: Props) {
     [suppressProgressTracking],
   );
 
+  // ── Reading position <-> sync ──────────────────────────────────────────────
+  // The tracker decides what may be written to the database and when a newer
+  // position from another device must be adopted (see core reader/position-sync).
+  const positionSyncRef = useRef<{ bookId: string; tracker: ReaderPositionSync } | null>(null);
+  // Relocations before this time restore the saved position (or jump to an
+  // adopted one); they are not user moves and must not be saved.
+  const restorePositionGuardUntilRef = useRef(0);
+
+  const getPositionSync = useCallback((): ReaderPositionSync => {
+    const existing = positionSyncRef.current;
+    if (existing?.bookId === bookId) return existing.tracker;
+
+    const current = useLibraryStore.getState().books.find((b) => b.id === bookId);
+    const tracker = new ReaderPositionSync(
+      {
+        updatedAt: current?.updatedAt ?? 0,
+        cfi: current?.currentCfi ?? null,
+        progress: current?.progress ?? 0,
+      },
+      {
+        save: async (position, baselineUpdatedAt) => {
+          const result = await runWithDbRetry(
+            () => saveBookProgress(bookId, position, baselineUpdatedAt),
+            { attempts: 10, initialDelayMs: 150 },
+          );
+          if (result.saved) {
+            useLibraryStore.getState().patchBookPosition(bookId, {
+              progress: position.progress,
+              currentCfi: position.currentCfi,
+              updatedAt: result.updatedAt,
+            });
+          }
+          return result;
+        },
+        load: () => getBookProgressState(bookId),
+      },
+    );
+    positionSyncRef.current = { bookId, tracker };
+    return tracker;
+  }, [bookId]);
+
+  const adoptRemotePosition = useCallback(
+    (remote: BookProgressState) => {
+      if (!remote.currentCfi) return;
+      getPositionSync().adopt(remote);
+      restorePositionGuardUntilRef.current = Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS;
+      useLibraryStore.getState().patchBookPosition(bookId, {
+        progress: remote.progress,
+        currentCfi: remote.currentCfi,
+        updatedAt: remote.updatedAt,
+      });
+      goToCFISafely(remote.currentCfi);
+    },
+    [bookId, getPositionSync, goToCFISafely],
+  );
+
+  const handlePositionOutcome = useCallback(
+    (outcome: PositionSyncOutcome) => {
+      if (outcome.type === "adopt") {
+        adoptRemotePosition(outcome.remote);
+      } else if (outcome.type === "conflict") {
+        const { remote } = outcome;
+        const keepLocal = () => getPositionSync().keepLocal(remote);
+        Alert.alert(
+          t("reader.positionConflictTitle", "其他设备的阅读进度不同"),
+          t("reader.positionConflictDescription", {
+            percent: Math.round(remote.progress * 100),
+            defaultValue: "另一台设备停在 {{percent}}%，要跳转过去吗？",
+          }),
+          [
+            {
+              text: t("reader.positionConflictKeep", "保留当前"),
+              style: "cancel",
+              onPress: keepLocal,
+            },
+            {
+              text: t("reader.positionConflictJump", "跳转"),
+              onPress: () => adoptRemotePosition(remote),
+            },
+          ],
+          { cancelable: true, onDismiss: keepLocal },
+        );
+      }
+    },
+    [adoptRemotePosition, getPositionSync, t],
+  );
+
+  const flushPosition = useCallback(async () => {
+    const current = positionSyncRef.current;
+    if (!current || current.bookId !== bookId) return;
+    try {
+      handlePositionOutcome(await current.tracker.flush());
+    } catch (err) {
+      console.error("[ReaderScreen] Failed to save reading position:", err);
+    }
+  }, [bookId, handlePositionOutcome]);
+
+  const flushPositionRef = useRef(flushPosition);
+  flushPositionRef.current = flushPosition;
+
+  // Throttled progress save (same as desktop - 5 seconds)
+  const throttledSaveProgress = useRef(
+    throttle(() => {
+      void flushPositionRef.current();
+    }, 5000),
+  ).current;
+
   // ── Search ─────────────────────────────────────────────────────────────────
   // Use bridgeRef for lazy access (bridge is initialized later)
   const search = useReaderSearch({
@@ -441,6 +543,8 @@ export function ReaderScreen({ route, navigation }: Props) {
   useEffect(() => {
     sessionProgressRef.current = null;
     totalBookCharactersRef.current = null;
+    positionSyncRef.current = null;
+    restorePositionGuardUntilRef.current = Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS;
     suppressProgressTracking(INITIAL_PROGRESS_RESTORE_GUARD_MS);
   }, [bookId]);
   const chapterTranslation = useChapterTranslation({
@@ -576,6 +680,11 @@ export function ReaderScreen({ route, navigation }: Props) {
       `);
     },
     onLoaded: () => {
+      // The first relocate after the view loads restores the saved position.
+      restorePositionGuardUntilRef.current = Math.max(
+        restorePositionGuardUntilRef.current,
+        Date.now() + INITIAL_PROGRESS_RESTORE_GUARD_MS,
+      );
       setLoading(false);
       const settings = useSettingsStore.getState().readSettings;
       const { fonts, selectedFontId: selId } = useFontStore.getState();
@@ -746,8 +855,13 @@ export function ReaderScreen({ route, navigation }: Props) {
         }
         lastCfiRef.current = detail.cfi;
         setCurrentCfi(detail.cfi);
-        // Use throttled save instead of immediate update
-        throttledSaveProgress(bookId, detail.fraction ?? 0, detail.cfi);
+        // Only positions the user moved to are saved, not the restore on open
+        const restoringPosition = Date.now() < restorePositionGuardUntilRef.current;
+        getPositionSync().noteRelocate(
+          { progress: detail.fraction ?? 0, cfi: detail.cfi },
+          { restoring: restoringPosition },
+        );
+        if (!restoringPosition) throttledSaveProgress();
       }
 
       // Mark translation ready after first successful relocate (CFI navigation done)
@@ -1075,8 +1189,13 @@ export function ReaderScreen({ route, navigation }: Props) {
   useEffect(() => {
     return eventBus.on("sync:completed", () => {
       void loadAnnotations(bookId);
+      // Adopt a newer position written by another device, or ask which to keep.
+      getPositionSync()
+        .checkRemote()
+        .then(handlePositionOutcome)
+        .catch((err) => console.error("[ReaderScreen] Failed to check synced position:", err));
     });
-  }, [bookId, loadAnnotations]);
+  }, [bookId, loadAnnotations, getPositionSync, handlePositionOutcome]);
 
   // Save progress immediately on unmount
   useEffect(() => {
@@ -1085,16 +1204,12 @@ export function ReaderScreen({ route, navigation }: Props) {
         stopFileServer();
         fileServerRef.current = null;
       }
-      if (lastCfiRef.current) {
-        const db = require("@readany/core/db/database");
-        runWithDbRetry(
-          () =>
-            db.updateBook(bookId, {
-              progress: progressRef.current,
-              currentCfi: lastCfiRef.current,
-            }),
-          { attempts: 10, initialDelayMs: 150 },
-        ).catch((err: Error) => console.error("Failed to save progress on unmount:", err));
+      // Closing the reader must not raise a conflict prompt, so the outcome is ignored.
+      const current = positionSyncRef.current;
+      if (current?.bookId === bookId) {
+        current.tracker
+          .flush()
+          .catch((err: Error) => console.error("Failed to save progress on unmount:", err));
       }
       const { useSyncStore } = require("@readany/core/stores/sync-store");
       useSyncStore.getState().syncNow?.();
