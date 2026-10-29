@@ -112,7 +112,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
             t("vectorize.unsupportedFormatTitle", "Unsupported format"),
             t(
               "vectorize.unsupportedFormatDesc",
-              "Mobile vectorization currently supports EPUB, PDF, TXT, and UMD books.",
+              "Mobile vectorization currently supports EPUB, PDF, FB2, FBZ, TXT, and UMD books.",
             ),
           );
           return;
