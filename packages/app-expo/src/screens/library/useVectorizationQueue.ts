@@ -14,7 +14,7 @@ import type { Book, VectorizeProgress } from "@readany/core/types";
 import * as FileSystem from "expo-file-system/legacy";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Alert } from "react-native";
+import { Alert, AppState } from "react-native";
 
 type Nav = NativeStackNavigationProp<RootStackParamList>;
 
@@ -34,7 +34,9 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
 
   const processOneBook = useCallback(
     async (book: Book, background: BackgroundVectorizeHandle, index: number, total: number) => {
-      console.log(`[Vectorize] Starting "${book.meta.title}" (${index + 1}/${total})`);
+      console.log(
+        `[Vectorize] Starting "${book.meta.title}" (${index + 1}/${total}), app ${AppState.currentState}`,
+      );
       background.bookStarted(book.meta.title, index, total);
       setVectorizingBookId(book.id);
       setVectorizingBookTitle(book.meta.title);
@@ -63,6 +65,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
         if (!chapters || chapters.length === 0) {
           throw new Error("No chapters extracted from book");
         }
+        console.log(`[Vectorize] Extracted ${chapters.length} chapters from "${book.meta.title}"`);
 
         await triggerVectorizeBook(book.id, book.filePath, chapters, (progress) => {
           setVectorProgress({ ...progress });
