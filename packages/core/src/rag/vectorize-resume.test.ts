@@ -185,6 +185,23 @@ describe("triggerVectorizeBook resume", () => {
     expect(state.embeddedTexts).toBeGreaterThan(state.inserted.length - 32);
   });
 
+  it("finishes with an injected yield even when timers never fire (screen off)", async () => {
+    vi.useFakeTimers(); // setTimeout would never resolve, like on a locked Android phone
+    try {
+      const yieldToUI = vi.fn(async () => undefined);
+      await triggerVectorizeBook("book", makeChapters(), config("all-MiniLM-L6-v2"), {
+        ...makeCallbacks(),
+        yieldToUI,
+      });
+
+      expect(yieldToUI).toHaveBeenCalled();
+      expect(state.inserted.length).toBeGreaterThan(0);
+      expect(state.embeddedTexts).toBe(state.inserted.length);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("works as before when nothing was saved", async () => {
     const callbacks = makeCallbacks();
     await triggerVectorizeBook("book", makeChapters(), config("all-MiniLM-L6-v2"), callbacks);

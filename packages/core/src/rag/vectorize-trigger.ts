@@ -20,13 +20,8 @@ import type { EmbeddingProvenance, VectorizeProgress } from "../types";
  * Supports both built-in (Transformers.js via Web Worker) and remote (OpenAI-compatible API) embedding models.
  */
 import { eventBus } from "../utils/event-bus";
+import { applyCheckpoint, checkpointEntries, embeddingModelKey, hasEmbedding } from "./checkpoint";
 import { chunkContent } from "./chunker";
-import {
-  applyCheckpoint,
-  checkpointEntries,
-  embeddingModelKey,
-  hasEmbedding,
-} from "./checkpoint";
 import { normalizeEmbeddingEndpoint } from "./embedding-provenance";
 import type { ChapterData } from "./rag-types";
 import { requestRemoteEmbeddingBatch } from "./remote-embedding";
@@ -64,13 +59,21 @@ export interface VectorizeTriggerCallbacks {
     bookId: string,
     state: { doneChunks: number; totalChunks: number } | null,
   ) => void;
+  /**
+   * Replaces the default `setTimeout(0)` yield between batches. Needed on Android:
+   * React Native's timers only fire on display frames, so with the screen off a plain
+   * setTimeout never resolves and the run freezes.
+   */
+  yieldToUI?: () => Promise<void>;
 }
 
 /** Hand a finished batch to the checkpoint store; a failure only costs resumability. */
-type PersistBatch = (batch: Array<{ chapterIndex: number; content: string; embedding?: number[] }>) => Promise<void>;
+type PersistBatch = (
+  batch: Array<{ chapterIndex: number; content: string; embedding?: number[] }>,
+) => Promise<void>;
 
 /** Yield to the event loop so UI can repaint */
-const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
+const defaultYieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** sqlite-vec currently owns one global vector dimension. */
 export function canStoreInSharedVectorDB(
@@ -116,6 +119,7 @@ export async function triggerVectorizeBook(
   };
   let checkpointedChunks = 0;
   let checkpointTotal = 0;
+  const yieldToUI = callbacks.yieldToUI ?? defaultYieldToUI;
 
   try {
     // Update book state: vectorizing
@@ -184,7 +188,9 @@ export async function triggerVectorizeBook(
     progress.resumedChunks = restored;
     onProgress?.(progress);
     if (restored > 0) {
-      console.log(`[Vectorize] Resuming ${bookId}: ${restored}/${allChunks.length} chunks restored`);
+      console.log(
+        `[Vectorize] Resuming ${bookId}: ${restored}/${allChunks.length} chunks restored`,
+      );
       callbacks.onCheckpoint?.(bookId, { doneChunks: restored, totalChunks: allChunks.length });
     }
     await yieldToUI();
@@ -212,10 +218,19 @@ export async function triggerVectorizeBook(
         progress,
         restored,
         persistBatch,
+        yieldToUI,
         onProgress,
       );
     } else {
-      await generateRemoteEmbeddings(pending, config, progress, restored, persistBatch, onProgress);
+      await generateRemoteEmbeddings(
+        pending,
+        config,
+        progress,
+        restored,
+        persistBatch,
+        yieldToUI,
+        onProgress,
+      );
     }
 
     // Phase 3: Store in database (batch insert for performance)
@@ -359,6 +374,7 @@ async function generateBuiltinEmbeddings(
   progress: VectorizeProgress,
   alreadyDone: number,
   persistBatch: PersistBatch,
+  yieldToUI: () => Promise<void>,
   onProgress?: VectorizeStatusCallback,
 ) {
   if (chunks.length === 0) return;
@@ -409,6 +425,7 @@ async function generateRemoteEmbeddings(
   progress: VectorizeProgress,
   alreadyDone: number,
   persistBatch: PersistBatch,
+  yieldToUI: () => Promise<void>,
   onProgress?: VectorizeStatusCallback,
 ) {
   const selectedModel = config.remoteModel;

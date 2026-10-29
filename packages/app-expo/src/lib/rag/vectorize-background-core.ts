@@ -142,6 +142,7 @@ export function createBackgroundVectorize(deps: BackgroundVectorizeDeps) {
         },
       );
       running = true;
+      console.log("[VectorizeBackground] Foreground service started");
       return true;
     } catch (err) {
       // Vectorization still works in the foreground without the service.
@@ -163,6 +164,9 @@ export function createBackgroundVectorize(deps: BackgroundVectorizeDeps) {
       console.warn("[VectorizeBackground] Could not stop the background service:", err);
     }
     const total = summary.done + summary.failed;
+    console.log(
+      `[VectorizeBackground] Foreground service stopped (${summary.done} done, ${summary.failed} failed)`,
+    );
     if (total === 0 || deps.isAppForeground()) return;
     try {
       await deps.notifier.notify(

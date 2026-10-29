@@ -1,5 +1,6 @@
 import type { ExtractorRef } from "@/components/rag/ExtractorWebView";
 import { inspectMobileBookForVectorize } from "@/lib/rag/auto-vectorize-book";
+import { waitUnlessBackground } from "@/lib/rag/background-timers";
 import {
   type BackgroundVectorizeHandle,
   acquireBackgroundVectorize,
@@ -33,6 +34,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
 
   const processOneBook = useCallback(
     async (book: Book, background: BackgroundVectorizeHandle, index: number, total: number) => {
+      console.log(`[Vectorize] Starting "${book.meta.title}" (${index + 1}/${total})`);
       background.bookStarted(book.meta.title, index, total);
       setVectorizingBookId(book.id);
       setVectorizingBookTitle(book.meta.title);
@@ -69,6 +71,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
           }
         });
         background.bookFinished(true);
+        console.log(`[Vectorize] Finished "${book.meta.title}"`);
 
         setVectorProgress({
           bookId: book.id,
@@ -76,7 +79,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
           processedChunks: 1,
           totalChunks: 1,
         });
-        await new Promise((resolve) => setTimeout(resolve, 800));
+        await waitUnlessBackground(800);
       } catch (err) {
         console.error(
           `[useVectorizationQueue] Vectorization failed for "${book.meta.title}":`,
@@ -107,7 +110,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
                 defaultValue: "{{title}}\n\n{{reason}}",
               }),
         );
-        await new Promise((resolve) => setTimeout(resolve, 1500));
+        await waitUnlessBackground(1500);
       }
     },
     [extractorRef, t],
