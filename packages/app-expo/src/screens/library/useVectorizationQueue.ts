@@ -1,5 +1,9 @@
 import type { ExtractorRef } from "@/components/rag/ExtractorWebView";
 import { inspectMobileBookForVectorize } from "@/lib/rag/auto-vectorize-book";
+import {
+  type BackgroundVectorizeHandle,
+  acquireBackgroundVectorize,
+} from "@/lib/rag/vectorize-background";
 import { triggerVectorizeBook } from "@/lib/rag/vectorize-trigger";
 import type { RootStackParamList } from "@/navigation/RootNavigator";
 import { useVectorModelStore } from "@/stores/vector-model-store";
@@ -28,7 +32,8 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
   const isProcessingRef = useRef(false);
 
   const processOneBook = useCallback(
-    async (book: Book) => {
+    async (book: Book, background: BackgroundVectorizeHandle, index: number, total: number) => {
+      background.bookStarted(book.meta.title, index, total);
       setVectorizingBookId(book.id);
       setVectorizingBookTitle(book.meta.title);
       setVectorProgress({
@@ -59,7 +64,11 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
 
         await triggerVectorizeBook(book.id, book.filePath, chapters, (progress) => {
           setVectorProgress({ ...progress });
+          if (progress.status === "embedding" && progress.totalChunks > 0) {
+            background.bookProgress(progress.processedChunks / progress.totalChunks);
+          }
         });
+        background.bookFinished(true);
 
         setVectorProgress({
           bookId: book.id,
@@ -73,6 +82,7 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
           `[useVectorizationQueue] Vectorization failed for "${book.meta.title}":`,
           err,
         );
+        background.bookFinished(false);
         setVectorProgress({
           bookId: book.id,
           status: "error",
@@ -107,15 +117,25 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
     if (isProcessingRef.current) return;
     isProcessingRef.current = true;
 
+    // Keeps the run alive with the screen off and shows progress in the notification shade.
+    const background = await acquireBackgroundVectorize();
+    let processed = 0;
     try {
       while (vectorQueueRef.current.length > 0) {
         const [nextBook, ...remainingBooks] = vectorQueueRef.current;
         if (!nextBook) break;
         vectorQueueRef.current = remainingBooks;
         setVectorQueue([...vectorQueueRef.current]);
-        await processOneBook(nextBook);
+        await processOneBook(
+          nextBook,
+          background,
+          processed,
+          processed + 1 + vectorQueueRef.current.length,
+        );
+        processed++;
       }
     } finally {
+      await background.release();
       isProcessingRef.current = false;
       setVectorizingBookId(null);
       setVectorProgress(null);
