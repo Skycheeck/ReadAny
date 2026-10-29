@@ -1,9 +1,12 @@
 import { BUILTIN_EMBEDDING_MODELS } from "../ai/builtin-embedding-models";
 import { generateLocalEmbeddings, loadEmbeddingPipeline } from "../ai/local-embedding-service";
 import {
+  clearVectorCheckpoint,
   deleteChunks,
   deleteVectorIndexProvenance,
   insertChunks,
+  loadVectorCheckpoint,
+  saveVectorCheckpointBatch,
   setVectorIndexProvenance,
 } from "../db/database";
 import type { EmbeddingProvenance, VectorizeProgress } from "../types";
@@ -18,6 +21,12 @@ import type { EmbeddingProvenance, VectorizeProgress } from "../types";
  */
 import { eventBus } from "../utils/event-bus";
 import { chunkContent } from "./chunker";
+import {
+  applyCheckpoint,
+  checkpointEntries,
+  embeddingModelKey,
+  hasEmbedding,
+} from "./checkpoint";
 import { normalizeEmbeddingEndpoint } from "./embedding-provenance";
 import type { ChapterData } from "./rag-types";
 import { requestRemoteEmbeddingBatch } from "./remote-embedding";
@@ -47,7 +56,18 @@ export interface VectorizeTriggerCallbacks {
     bookId: string,
     update: { isVectorized: boolean; vectorizeProgress: number },
   ) => void;
+  /**
+   * Called whenever embeddings were saved for an unfinished run (progress that survives
+   * an interruption), and with `null` once the book is fully indexed.
+   */
+  onCheckpoint?: (
+    bookId: string,
+    state: { doneChunks: number; totalChunks: number } | null,
+  ) => void;
 }
+
+/** Hand a finished batch to the checkpoint store; a failure only costs resumability. */
+type PersistBatch = (batch: Array<{ chapterIndex: number; content: string; embedding?: number[] }>) => Promise<void>;
 
 /** Yield to the event loop so UI can repaint */
 const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -94,6 +114,8 @@ export async function triggerVectorizeBook(
     processedChunks: 0,
     status: "chunking",
   };
+  let checkpointedChunks = 0;
+  let checkpointTotal = 0;
 
   try {
     // Update book state: vectorizing
@@ -145,22 +167,55 @@ export async function triggerVectorizeBook(
       throw new Error("No chunks were generated from the book content.");
     }
 
+    // Resume: reuse embeddings saved by an earlier run of the same book and model.
+    const modelKey = embeddingModelKey(config);
+    let restored = 0;
+    try {
+      restored = applyCheckpoint(allChunks, await loadVectorCheckpoint(bookId, modelKey));
+    } catch (err) {
+      console.warn("[Vectorize] Could not read the saved checkpoint, starting from scratch:", err);
+    }
+    checkpointedChunks = restored;
+    checkpointTotal = allChunks.length;
+
     progress.totalChunks = allChunks.length;
     progress.status = "embedding";
-    progress.processedChunks = 0;
+    progress.processedChunks = restored;
+    progress.resumedChunks = restored;
     onProgress?.(progress);
+    if (restored > 0) {
+      console.log(`[Vectorize] Resuming ${bookId}: ${restored}/${allChunks.length} chunks restored`);
+      callbacks.onCheckpoint?.(bookId, { doneChunks: restored, totalChunks: allChunks.length });
+    }
     await yieldToUI();
 
-    // Phase 2: Generate embeddings
+    const persistBatch: PersistBatch = async (batch) => {
+      try {
+        const entries = checkpointEntries(batch);
+        await saveVectorCheckpointBatch(bookId, modelKey, allChunks.length, entries);
+        checkpointedChunks += entries.length;
+        callbacks.onCheckpoint?.(bookId, {
+          doneChunks: checkpointedChunks,
+          totalChunks: allChunks.length,
+        });
+      } catch (err) {
+        console.warn("[Vectorize] Could not save checkpoint:", err);
+      }
+    };
+
+    // Phase 2: Generate embeddings (only for chunks that were not restored)
+    const pending = allChunks.filter((chunk) => !hasEmbedding(chunk));
     if (config.vectorModelMode === "builtin") {
       await generateBuiltinEmbeddings(
-        allChunks,
+        pending,
         config.selectedBuiltinModelId,
         progress,
+        restored,
+        persistBatch,
         onProgress,
       );
     } else {
-      await generateRemoteEmbeddings(allChunks, config, progress, onProgress);
+      await generateRemoteEmbeddings(pending, config, progress, restored, persistBatch, onProgress);
     }
 
     // Phase 3: Store in database (batch insert for performance)
@@ -234,6 +289,14 @@ export async function triggerVectorizeBook(
     const provenance = getEmbeddingProvenance(config, allChunks[0]?.embedding?.length ?? 0);
     await setVectorIndexProvenance({ bookId, ...provenance, createdAt: Date.now() });
 
+    // The index is complete: the checkpoint is no longer needed.
+    try {
+      await clearVectorCheckpoint(bookId);
+    } catch (err) {
+      console.warn("[Vectorize] Could not clear checkpoint:", err);
+    }
+    callbacks.onCheckpoint?.(bookId, null);
+
     // Invalidate search cache so next query picks up new embeddings
     invalidateChunkCache(bookId);
 
@@ -259,6 +322,12 @@ export async function triggerVectorizeBook(
       isVectorized: false,
       vectorizeProgress: 0,
     });
+    if (checkpointedChunks > 0 && checkpointTotal > 0) {
+      callbacks.onCheckpoint?.(bookId, {
+        doneChunks: checkpointedChunks,
+        totalChunks: checkpointTotal,
+      });
+    }
     eventBus.emit("vectorize:error", { bookId, error: message });
     throw err;
   }
@@ -285,11 +354,14 @@ function getEmbeddingProvenance(
 
 /** Generate embeddings using a built-in Transformers.js model (via Web Worker) */
 async function generateBuiltinEmbeddings(
-  chunks: Array<{ content: string; embedding?: number[] }>,
+  chunks: Array<{ chapterIndex: number; content: string; embedding?: number[] }>,
   builtinModelId: string | null,
   progress: VectorizeProgress,
+  alreadyDone: number,
+  persistBatch: PersistBatch,
   onProgress?: VectorizeStatusCallback,
 ) {
+  if (chunks.length === 0) return;
   if (!builtinModelId) {
     throw new Error("No built-in model selected. Please select one in Settings → Vector Model.");
   }
@@ -311,7 +383,7 @@ async function generateBuiltinEmbeddings(
 
     // generateLocalEmbeddings now runs in Worker with per-item progress
     const embeddings = await generateLocalEmbeddings(builtinModelId, texts, (done, _total) => {
-      globalProcessed = batchOffset + done;
+      globalProcessed = alreadyDone + batchOffset + done;
       progress.processedChunks = globalProcessed;
       eventBus.emit("vectorize:progress", {
         bookId: progress.bookId,
@@ -324,6 +396,7 @@ async function generateBuiltinEmbeddings(
     for (let j = 0; j < batch.length; j++) {
       batch[j].embedding = embeddings[j];
     }
+    await persistBatch(batch);
 
     await yieldToUI();
   }
@@ -331,9 +404,11 @@ async function generateBuiltinEmbeddings(
 
 /** Generate embeddings using a remote API endpoint */
 async function generateRemoteEmbeddings(
-  chunks: Array<{ content: string; embedding?: number[] }>,
+  chunks: Array<{ chapterIndex: number; content: string; embedding?: number[] }>,
   config: VectorizeTriggerConfig,
   progress: VectorizeProgress,
+  alreadyDone: number,
+  persistBatch: PersistBatch,
   onProgress?: VectorizeStatusCallback,
 ) {
   const selectedModel = config.remoteModel;
@@ -397,7 +472,9 @@ async function generateRemoteEmbeddings(
       }
     }
 
-    progress.processedChunks = Math.min(i + batchSize, chunks.length);
+    await persistBatch(batch);
+
+    progress.processedChunks = alreadyDone + Math.min(i + batchSize, chunks.length);
     eventBus.emit("vectorize:progress", {
       bookId: progress.bookId,
       progress: progress.processedChunks / progress.totalChunks,

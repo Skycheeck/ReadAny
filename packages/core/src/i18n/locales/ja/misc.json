@@ -1,5 +1,8 @@
 {
   "vectorize": {
+    "stoppedTitle": "ベクトル化が停止しました",
+    "stoppedResumable": "{{title}}\n\n{{reason}}\n\n{{percent}}% を保存済みです。もう一度ベクトル化すると、そこから再開します。",
+    "stoppedNoProgress": "{{title}}\n\n{{reason}}",
     "title": "ベクトルテスト",
     "chunks": "チャンク",
     "vector": "ベクトル",

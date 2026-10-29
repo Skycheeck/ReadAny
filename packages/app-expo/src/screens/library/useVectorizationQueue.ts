@@ -3,6 +3,7 @@ import { inspectMobileBookForVectorize } from "@/lib/rag/auto-vectorize-book";
 import { triggerVectorizeBook } from "@/lib/rag/vectorize-trigger";
 import type { RootStackParamList } from "@/navigation/RootNavigator";
 import { useVectorModelStore } from "@/stores/vector-model-store";
+import { checkpointPercent, useVectorStatusStore } from "@/stores/vector-status-store";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import type { Book, VectorizeProgress } from "@readany/core/types";
 import * as FileSystem from "expo-file-system/legacy";
@@ -78,10 +79,28 @@ export function useVectorizationQueue({ extractorRef, nav }: UseVectorizationQue
           processedChunks: 0,
           totalChunks: 0,
         });
+        const savedPct = checkpointPercent(useVectorStatusStore.getState().checkpoints[book.id]);
+        const reason = err instanceof Error ? err.message : String(err);
+        Alert.alert(
+          t("vectorize.stoppedTitle", "Vectorization stopped"),
+          savedPct > 0
+            ? t("vectorize.stoppedResumable", {
+                title: book.meta.title,
+                percent: savedPct,
+                reason,
+                defaultValue:
+                  "{{title}}\n\n{{reason}}\n\n{{percent}}% is saved. Vectorize the book again to continue from there.",
+              })
+            : t("vectorize.stoppedNoProgress", {
+                title: book.meta.title,
+                reason,
+                defaultValue: "{{title}}\n\n{{reason}}",
+              }),
+        );
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     },
-    [extractorRef],
+    [extractorRef, t],
   );
 
   const processQueue = useCallback(async () => {

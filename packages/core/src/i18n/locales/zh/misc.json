@@ -1,5 +1,8 @@
 {
   "vectorize": {
+    "stoppedTitle": "向量化已中断",
+    "stoppedResumable": "{{title}}\n\n{{reason}}\n\n已保存 {{percent}}%，再次向量化即可从该进度继续。",
+    "stoppedNoProgress": "{{title}}\n\n{{reason}}",
     "title": "向量测试",
     "chunks": "分块",
     "vector": "向量",

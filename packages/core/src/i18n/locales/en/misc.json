@@ -1,5 +1,8 @@
 {
   "vectorize": {
+    "stoppedTitle": "Vectorization stopped",
+    "stoppedResumable": "{{title}}\n\n{{reason}}\n\n{{percent}}% is saved. Vectorize the book again to continue from there.",
+    "stoppedNoProgress": "{{title}}\n\n{{reason}}",
     "title": "Vector Test",
     "chunks": "Chunks",
     "vector": "Vector",
